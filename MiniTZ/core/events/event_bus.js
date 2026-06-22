@@ -1,43 +1,87 @@
-const EventBus = require("../events/event_bus");
-
-class Scheduler {
+class EventBus {
     constructor() {
-        this.queue = [];
-        this.processing = false;
+        this.listeners = new Map();
+        this.history = [];
     }
 
-    add(task) {
-        if (!task || !task.id) {
-            throw new Error("[SCHEDULER] Invalid task");
+    on(event, handler) {
+        if (!event || typeof handler !== "function") {
+            throw new Error("[EVENT_BUS] Invalid listener registration");
         }
 
-        this.queue.push(task);
+        if (!this.listeners.has(event)) {
+            this.listeners.set(event, []);
+        }
 
-        EventBus.emit("scheduler:task_added", {
-            taskId: task.id,
+        this.listeners.get(event).push(handler);
+
+        return true;
+    }
+
+    emit(event, payload = {}) {
+        if (!event) {
+            throw new Error("[EVENT_BUS] Missing event name");
+        }
+
+        const entry = {
+            event,
+            payload,
             timestamp: Date.now()
-        });
+        };
+
+        this.history.push(entry);
+
+        const handlers = this.listeners.get(event);
+
+        if (handlers && handlers.length > 0) {
+            for (const handler of handlers) {
+                try {
+                    handler(payload);
+                } catch (err) {
+                    console.error(`[EVENT_BUS] handler error on ${event}`, err);
+                }
+            }
+        }
+
+        return true;
     }
 
-    getNextBatch(limit = 5) {
-        return this.queue.splice(0, limit);
+    off(event, handler) {
+        const handlers = this.listeners.get(event);
+
+        if (!handlers) return false;
+
+        const index = handlers.indexOf(handler);
+
+        if (index !== -1) {
+            handlers.splice(index, 1);
+        }
+
+        return true;
     }
 
-    size() {
-        return this.queue.length;
+    once(event, handler) {
+        const wrapper = (payload) => {
+            handler(payload);
+            this.off(event, wrapper);
+        };
+
+        return this.on(event, wrapper);
     }
 
-    hasWork() {
-        return this.queue.length > 0;
+    getHistory(limit = 100) {
+        return this.history.slice(-limit);
     }
 
-    clear() {
-        this.queue = [];
+    snapshot() {
+        const snapshot = {};
 
-        EventBus.emit("scheduler:cleared", {
-            timestamp: Date.now()
-        });
+        for (const [event, handlers] of this.listeners.entries()) {
+            snapshot[event] = handlers.length;
+        }
+
+        return snapshot;
     }
 }
 
-module.exports = new Scheduler();
+module.exports = new EventBus();
