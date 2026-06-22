@@ -8,38 +8,86 @@ class ClusterConsensusGuard {
         this.taskLocks = new Map();
         this.frozen = false;
         this.freezeReason = null;
+        this.lockSequence = 0;
+    }
+
+    getEligibleLeaderNodes() {
+        return NodeManager
+            .listNodes()
+            .filter(node => node.status === "ACTIVE")
+            .sort((a, b) => a.id.localeCompare(b.id));
+    }
+
+    getQuorumNodes() {
+        return NodeManager
+            .listNodes()
+            .filter(node =>
+                node.status === "ACTIVE" ||
+                node.status === "DEGRADED"
+            )
+            .sort((a, b) => a.id.localeCompare(b.id));
+    }
+
+    getClusterSize() {
+        return NodeManager.listNodes().length;
+    }
+
+    getRequiredQuorum() {
+        const total = this.getClusterSize();
+
+        if (total === 0) {
+            return 0;
+        }
+
+        return Math.floor(total / 2) + 1;
+    }
+
+    hasQuorum() {
+        return this.getQuorumNodes().length >= this.getRequiredQuorum();
     }
 
     electLeader() {
-        const nodes = NodeManager
-            .listNodes()
-            .filter(node => node.status === "ACTIVE");
-
-        if (nodes.length === 0) {
-            throw new Error("[CONSENSUS_GUARD] No active nodes available");
+        if (this.frozen) {
+            throw new Error(`[CONSENSUS_GUARD] Cluster frozen: ${this.freezeReason}`);
         }
 
-        const leader = nodes
-            .map(node => node.id)
-            .sort()[0];
+        if (!this.hasQuorum()) {
+            throw new Error("[CONSENSUS_GUARD] Cannot elect leader without quorum");
+        }
 
-        this.term += 1;
-        this.leaderNodeId = leader;
+        const eligibleNodes = this.getEligibleLeaderNodes();
 
-        EventBus.emit("consensus:leader_elected", {
-            leaderNodeId: leader,
-            term: this.term,
-            timestamp: Date.now()
-        });
+        if (eligibleNodes.length === 0) {
+            throw new Error("[CONSENSUS_GUARD] No active node available for leadership");
+        }
+
+        const selectedLeader = eligibleNodes[0].id;
+
+        if (this.leaderNodeId !== selectedLeader) {
+            this.term += 1;
+            this.leaderNodeId = selectedLeader;
+
+            EventBus.emit("consensus:leader_elected", {
+                leaderNodeId: this.leaderNodeId,
+                term: this.term,
+                timestamp: Date.now()
+            });
+        }
 
         return {
-            leaderNodeId: leader,
+            leaderNodeId: this.leaderNodeId,
             term: this.term
         };
     }
 
     getLeader() {
         if (!this.leaderNodeId) {
+            return this.electLeader().leaderNodeId;
+        }
+
+        const node = NodeManager.getNode(this.leaderNodeId);
+
+        if (!node || node.status !== "ACTIVE") {
             return this.electLeader().leaderNodeId;
         }
 
@@ -51,6 +99,10 @@ class ClusterConsensusGuard {
             throw new Error(`[CONSENSUS_GUARD] Cluster frozen: ${this.freezeReason}`);
         }
 
+        return this.assertLeaderIdentity(nodeId);
+    }
+
+    assertLeaderIdentity(nodeId) {
         if (!nodeId) {
             throw new Error("[CONSENSUS_GUARD] Missing nodeId");
         }
@@ -58,7 +110,7 @@ class ClusterConsensusGuard {
         const leader = this.getLeader();
 
         if (leader !== nodeId) {
-            throw new Error("[CONSENSUS_GUARD] Node is not leader");
+            throw new Error("[CONSENSUS_GUARD] Node is not the current leader");
         }
 
         return true;
@@ -69,19 +121,30 @@ class ClusterConsensusGuard {
             throw new Error("[CONSENSUS_GUARD] Missing taskId or nodeId");
         }
 
+        if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
+            throw new Error("[CONSENSUS_GUARD] Invalid lock ttlMs");
+        }
+
         this.assertLeader(nodeId);
 
-        const existing = this.taskLocks.get(taskId);
-        const now = Date.now();
-
-        if (existing && existing.expiresAt > now) {
-            throw new Error("[CONSENSUS_GUARD] Task already locked");
+        if (!this.hasQuorum()) {
+            throw new Error("[CONSENSUS_GUARD] Quorum not available");
         }
+
+        const now = Date.now();
+        const existing = this.taskLocks.get(taskId);
+
+        if (existing && existing.expiresAt > now && existing.status === "ACTIVE") {
+            throw new Error("[CONSENSUS_GUARD] Task already has an active lock");
+        }
+
+        this.lockSequence += 1;
 
         const lock = {
             taskId,
             ownerNodeId: nodeId,
             term: this.term,
+            lockSequence: this.lockSequence,
             status: "ACTIVE",
             createdAt: now,
             expiresAt: now + ttlMs
@@ -89,10 +152,11 @@ class ClusterConsensusGuard {
 
         this.taskLocks.set(taskId, lock);
 
-        EventBus.emit("consensus:task_locked", {
+        EventBus.emit("consensus:task_lock_acquired", {
             taskId,
             ownerNodeId: nodeId,
             term: this.term,
+            lockSequence: this.lockSequence,
             timestamp: now
         });
 
@@ -100,12 +164,27 @@ class ClusterConsensusGuard {
     }
 
     validateTaskLock(taskId, nodeId) {
+        if (this.frozen) {
+            return {
+                valid: false,
+                reason: "CLUSTER_FROZEN",
+                freezeReason: this.freezeReason
+            };
+        }
+
         const lock = this.taskLocks.get(taskId);
 
         if (!lock) {
             return {
                 valid: false,
                 reason: "LOCK_NOT_FOUND"
+            };
+        }
+
+        if (lock.status !== "ACTIVE") {
+            return {
+                valid: false,
+                reason: "LOCK_NOT_ACTIVE"
             };
         }
 
@@ -119,12 +198,18 @@ class ClusterConsensusGuard {
         if (lock.term !== this.term) {
             return {
                 valid: false,
-                reason: "STALE_TERM"
+                reason: "STALE_CONSENSUS_TERM"
             };
         }
 
         if (Date.now() > lock.expiresAt) {
             this.taskLocks.delete(taskId);
+
+            EventBus.emit("consensus:task_lock_expired", {
+                taskId,
+                ownerNodeId: nodeId,
+                timestamp: Date.now()
+            });
 
             return {
                 valid: false,
@@ -134,14 +219,21 @@ class ClusterConsensusGuard {
 
         return {
             valid: true,
-            reason: "LOCK_VALID"
+            reason: "LOCK_VALID",
+            lock
         };
     }
 
     releaseTaskLock(taskId, nodeId) {
+        if (!taskId || !nodeId) {
+            throw new Error("[CONSENSUS_GUARD] Missing taskId or nodeId");
+        }
+
         const lock = this.taskLocks.get(taskId);
 
-        if (!lock) return false;
+        if (!lock) {
+            return false;
+        }
 
         if (lock.ownerNodeId !== nodeId && nodeId !== this.leaderNodeId) {
             throw new Error("[CONSENSUS_GUARD] Node cannot release this lock");
@@ -158,15 +250,38 @@ class ClusterConsensusGuard {
         return true;
     }
 
+    expireLocks() {
+        const now = Date.now();
+        const expired = [];
+
+        for (const [taskId, lock] of this.taskLocks.entries()) {
+            if (lock.expiresAt <= now) {
+                this.taskLocks.delete(taskId);
+                expired.push(taskId);
+            }
+        }
+
+        if (expired.length > 0) {
+            EventBus.emit("consensus:locks_expired", {
+                taskIds: expired,
+                timestamp: now
+            });
+        }
+
+        return expired;
+    }
+
     detectSplitBrain(reports) {
         if (!Array.isArray(reports)) {
-            throw new Error("[CONSENSUS_GUARD] Reports must be array");
+            throw new Error("[CONSENSUS_GUARD] Reports must be an array");
         }
 
         const leadersByTerm = new Map();
 
         for (const report of reports) {
-            if (!report || !report.term || !report.leaderNodeId) continue;
+            if (!report || !report.term || !report.leaderNodeId) {
+                continue;
+            }
 
             if (!leadersByTerm.has(report.term)) {
                 leadersByTerm.set(report.term, new Set());
@@ -181,7 +296,7 @@ class ClusterConsensusGuard {
 
                 EventBus.emit("consensus:split_brain_detected", {
                     term,
-                    leaders: Array.from(leaders),
+                    leaders: Array.from(leaders).sort(),
                     timestamp: Date.now()
                 });
 
@@ -200,10 +315,15 @@ class ClusterConsensusGuard {
             reason: this.freezeReason,
             timestamp: Date.now()
         });
+
+        return {
+            frozen: this.frozen,
+            reason: this.freezeReason
+        };
     }
 
     unfreeze(nodeId) {
-        this.assertLeader(nodeId);
+        this.assertLeaderIdentity(nodeId);
 
         this.frozen = false;
         this.freezeReason = null;
@@ -222,7 +342,13 @@ class ClusterConsensusGuard {
             leaderNodeId: this.leaderNodeId,
             frozen: this.frozen,
             freezeReason: this.freezeReason,
-            activeLocks: this.taskLocks.size
+            quorum: {
+                available: this.hasQuorum(),
+                required: this.getRequiredQuorum(),
+                present: this.getQuorumNodes().length
+            },
+            activeLocks: Array.from(this.taskLocks.values())
+                .sort((a, b) => a.taskId.localeCompare(b.taskId))
         };
     }
 }
