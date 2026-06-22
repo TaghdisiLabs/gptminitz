@@ -1,76 +1,100 @@
 const EventBus = require("../events/event_bus");
-const HealthMonitor = require("./health_monitor");
+const NodeManager = require("./node_manager");
+const ClusterHealthMonitor = require("./health_monitor");
 
 class FailureDetector {
     constructor() {
-        this.detectionWindowMs = 10000; // 10s
-        this.suspectedNodes = new Map();
+        this.timeoutMs = 30000;
+        this.failures = new Map();
     }
 
-    analyze(nodeId) {
-        const status = HealthMonitor.getStatus(nodeId);
-
-        if (!status) {
-            throw new Error("[FAILURE_DETECTOR] Unknown node");
+    analyzeNode(nodeId) {
+        if (!nodeId) {
+            throw new Error("[FAILURE_DETECTOR] Missing nodeId");
         }
 
+        const node = NodeManager.listNodes().find(n => n.id === nodeId);
+
+        if (!node) {
+            const failure = this.recordFailure(nodeId, "NODE_NOT_REGISTERED");
+            return failure;
+        }
+
+        const health = ClusterHealthMonitor.getStatus(nodeId);
         const now = Date.now();
-        const lastCheck = status.lastCheck || 0;
 
-        // timeout-based failure detection
-        if (now - lastCheck > this.detectionWindowMs) {
-            this.suspectedNodes.set(nodeId, {
-                reason: "TIMEOUT",
-                detectedAt: now
-            });
-
-            EventBus.emit("failure:detected", {
-                nodeId,
-                reason: "TIMEOUT"
-            });
-
-            return "FAILED";
+        if (!health) {
+            return this.recordFailure(nodeId, "HEALTH_NOT_REGISTERED");
         }
 
-        if (status.status === "UNHEALTHY") {
-            this.suspectedNodes.set(nodeId, {
-                reason: "UNHEALTHY_STATUS",
-                detectedAt: now
-            });
-
-            EventBus.emit("failure:detected", {
-                nodeId,
-                reason: "UNHEALTHY_STATUS"
-            });
-
-            return "FAILED";
+        if (health.status === "UNHEALTHY") {
+            return this.recordFailure(nodeId, "UNHEALTHY_STATUS");
         }
 
-        return "OK";
-    }
+        if (health.status === "UNREACHABLE") {
+            return this.recordFailure(nodeId, "UNREACHABLE_STATUS");
+        }
 
-    getSuspicions() {
-        return Array.from(this.suspectedNodes.entries()).map(([nodeId, data]) => ({
+        if (now - health.lastCheck > this.timeoutMs) {
+            return this.recordFailure(nodeId, "HEARTBEAT_TIMEOUT");
+        }
+
+        this.clearFailure(nodeId);
+
+        return {
             nodeId,
-            ...data
-        }));
+            failed: false,
+            reason: "OK",
+            timestamp: now
+        };
     }
 
-    clear(nodeId) {
-        if (!nodeId) return false;
+    scanCluster() {
+        const nodes = NodeManager.listNodes();
 
-        this.suspectedNodes.delete(nodeId);
+        return nodes.map(node => this.analyzeNode(node.id));
+    }
 
-        EventBus.emit("failure:cleared", {
-            nodeId
-        });
+    recordFailure(nodeId, reason) {
+        const failure = {
+            nodeId,
+            failed: true,
+            reason,
+            timestamp: Date.now()
+        };
+
+        this.failures.set(nodeId, failure);
+
+        EventBus.emit("cluster_failure:detected", failure);
+
+        return failure;
+    }
+
+    clearFailure(nodeId) {
+        if (this.failures.has(nodeId)) {
+            this.failures.delete(nodeId);
+
+            EventBus.emit("cluster_failure:cleared", {
+                nodeId,
+                timestamp: Date.now()
+            });
+        }
 
         return true;
     }
 
+    getFailure(nodeId) {
+        return this.failures.get(nodeId) || null;
+    }
+
+    listFailures() {
+        return Array.from(this.failures.values());
+    }
+
     snapshot() {
         return {
-            suspected: this.suspectedNodes.size
+            activeFailures: this.failures.size,
+            failures: this.listFailures()
         };
     }
 }
