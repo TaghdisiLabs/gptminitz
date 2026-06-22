@@ -1,67 +1,107 @@
 const EventBus = require("../events/event_bus");
 const NodeManager = require("./node_manager");
+const FailureDetector = require("./failure_detector");
 
-class TaskRecoveryEngine {
+class ClusterRebalancer {
     constructor() {
-        this.failedTasks = new Map();
-        this.recoveredTasks = new Map();
+        this.rebalanceHistory = [];
+        this.loadGapThreshold = 20;
     }
 
-    recordFailure(task, reason) {
-        if (!task || !task.id) {
-            throw new Error("[TASK_RECOVERY] Invalid task");
-        }
+    analyzeClusterLoad() {
+        const failures = new Set(
+            FailureDetector.listFailures().map(failure => failure.nodeId)
+        );
 
-        this.failedTasks.set(task.id, {
-            task,
-            reason,
-            failedAt: Date.now()
-        });
-
-        EventBus.emit("task_recovery:recorded", {
-            taskId: task.id,
-            reason
-        });
-
-        return true;
+        return NodeManager
+            .listNodes()
+            .filter(node => node.status === "ACTIVE")
+            .filter(node => !failures.has(node.id))
+            .map(node => ({
+                nodeId: node.id,
+                load: Number.isFinite(node.load) ? node.load : 0,
+                capacity: Number.isFinite(node.capacity) ? node.capacity : 100,
+                available: Math.max(
+                    0,
+                    (Number.isFinite(node.capacity) ? node.capacity : 100) -
+                    (Number.isFinite(node.load) ? node.load : 0)
+                )
+            }))
+            .sort((a, b) => {
+                if (b.load !== a.load) return b.load - a.load;
+                return a.nodeId.localeCompare(b.nodeId);
+            });
     }
 
-    recover(taskId) {
-        const record = this.failedTasks.get(taskId);
+    createPlan() {
+        const nodes = this.analyzeClusterLoad();
 
-        if (!record) {
-            throw new Error("[TASK_RECOVERY] Task not found");
+        if (nodes.length < 2) {
+            return {
+                required: false,
+                reason: "INSUFFICIENT_ACTIVE_NODES",
+                actions: []
+            };
         }
 
-        const recoveryTask = {
-            ...record.task,
-            retry: (record.task.retry || 0) + 1,
-            recoveredAt: Date.now()
+        const mostLoaded = nodes[0];
+        const leastLoaded = nodes[nodes.length - 1];
+
+        const loadGap = mostLoaded.load - leastLoaded.load;
+
+        if (loadGap < this.loadGapThreshold) {
+            return {
+                required: false,
+                reason: "LOAD_WITHIN_THRESHOLD",
+                actions: []
+            };
+        }
+
+        const transferableLoad = Math.floor(loadGap / 2);
+
+        const action = {
+            fromNodeId: mostLoaded.nodeId,
+            toNodeId: leastLoaded.nodeId,
+            loadUnits: transferableLoad,
+            reason: "LOAD_REBALANCE",
+            timestamp: Date.now()
         };
 
-        this.recoveredTasks.set(taskId, recoveryTask);
-        this.failedTasks.delete(taskId);
-
-        EventBus.emit("task_recovery:recovered", {
-            taskId,
-            retry: recoveryTask.retry
-        });
-
-        return recoveryTask;
+        return {
+            required: true,
+            reason: "LOAD_IMBALANCE",
+            actions: [action]
+        };
     }
 
-    retryFailed(limit = 10) {
-        const tasks = Array.from(this.failedTasks.keys()).slice(0, limit);
+    rebalance() {
+        const plan = this.createPlan();
 
-        return tasks.map(id => this.recover(id));
+        if (!plan.required) {
+            EventBus.emit("cluster_rebalance:not_required", {
+                reason: plan.reason,
+                timestamp: Date.now()
+            });
+
+            return plan;
+        }
+
+        this.rebalanceHistory.push(plan);
+
+        EventBus.emit("cluster_rebalance:planned", {
+            actions: plan.actions,
+            timestamp: Date.now()
+        });
+
+        return plan;
     }
 
     snapshot() {
         return {
-            failed: this.failedTasks.size,
-            recovered: this.recoveredTasks.size
+            historyCount: this.rebalanceHistory.length,
+            lastPlan: this.rebalanceHistory[this.rebalanceHistory.length - 1] || null
         };
     }
 }
 
-module.exports = new TaskRecoveryEngine();
+module.exports = new ClusterRebalancer();
