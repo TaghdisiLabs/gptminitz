@@ -3,81 +3,199 @@ const EventBus = require("../events/event_bus");
 class NodeManager {
     constructor() {
         this.nodes = new Map();
-        this.leader = null;
+        this.leaderNodeId = null;
+
+        this.allowedStatuses = new Set([
+            "ACTIVE",
+            "DEGRADED",
+            "DRAINING",
+            "UNREACHABLE",
+            "REMOVED"
+        ]);
     }
 
     registerNode(node) {
         if (!node || !node.id) {
-            throw new Error("[NODE_MANAGER] Invalid node");
+            throw new Error("[NODE_MANAGER] Invalid node registration");
         }
 
-        this.nodes.set(node.id, {
-            ...node,
+        const now = Date.now();
+
+        const record = {
+            id: node.id,
+            address: node.address || null,
+            role: node.role || "WORKER",
             status: "ACTIVE",
-            lastSeen: Date.now()
-        });
+            capacity: Number.isFinite(node.capacity) ? node.capacity : 100,
+            load: Number.isFinite(node.load) ? node.load : 0,
+            metadata: node.metadata || {},
+            registeredAt: now,
+            lastSeen: now
+        };
+
+        this.nodes.set(record.id, record);
+
+        this.recalculateLeader();
 
         EventBus.emit("cluster:node_registered", {
-            nodeId: node.id
+            nodeId: record.id,
+            role: record.role,
+            timestamp: now
         });
 
-        if (!this.leader) {
-            this.leader = node.id;
-            EventBus.emit("cluster:leader_elected", {
-                leader: this.leader
-            });
-        }
-
-        return true;
+        return record;
     }
 
-    heartbeat(nodeId) {
-        const node = this.nodes.get(nodeId);
+    updateNode(nodeId, patch = {}) {
+        const node = this.getNode(nodeId);
 
         if (!node) {
             throw new Error("[NODE_MANAGER] Node not found");
         }
 
-        node.lastSeen = Date.now();
-        node.status = "ACTIVE";
+        if (patch.status && !this.allowedStatuses.has(patch.status)) {
+            throw new Error(`[NODE_MANAGER] Invalid node status: ${patch.status}`);
+        }
 
-        EventBus.emit("cluster:heartbeat", {
-            nodeId
+        const updated = {
+            ...node,
+            ...patch,
+            id: node.id,
+            lastSeen: patch.lastSeen || node.lastSeen
+        };
+
+        this.nodes.set(nodeId, updated);
+
+        if (patch.status) {
+            this.recalculateLeader();
+        }
+
+        EventBus.emit("cluster:node_updated", {
+            nodeId,
+            patch,
+            timestamp: Date.now()
         });
 
-        return true;
+        return updated;
+    }
+
+    heartbeat(nodeId, telemetry = {}) {
+        const node = this.getNode(nodeId);
+
+        if (!node) {
+            throw new Error("[NODE_MANAGER] Node not found");
+        }
+
+        const updated = {
+            ...node,
+            status: telemetry.status || node.status || "ACTIVE",
+            load: Number.isFinite(telemetry.load) ? telemetry.load : node.load,
+            capacity: Number.isFinite(telemetry.capacity) ? telemetry.capacity : node.capacity,
+            metadata: {
+                ...node.metadata,
+                ...(telemetry.metadata || {})
+            },
+            lastSeen: Date.now()
+        };
+
+        if (!this.allowedStatuses.has(updated.status)) {
+            throw new Error(`[NODE_MANAGER] Invalid heartbeat status: ${updated.status}`);
+        }
+
+        this.nodes.set(nodeId, updated);
+
+        EventBus.emit("cluster:node_heartbeat", {
+            nodeId,
+            status: updated.status,
+            load: updated.load,
+            timestamp: updated.lastSeen
+        });
+
+        return updated;
+    }
+
+    markStatus(nodeId, status) {
+        if (!this.allowedStatuses.has(status)) {
+            throw new Error(`[NODE_MANAGER] Invalid node status: ${status}`);
+        }
+
+        return this.updateNode(nodeId, {
+            status,
+            lastSeen: Date.now()
+        });
     }
 
     removeNode(nodeId) {
-        const exists = this.nodes.has(nodeId);
+        const node = this.getNode(nodeId);
 
-        if (!exists) return false;
-
-        this.nodes.delete(nodeId);
-
-        if (this.leader === nodeId) {
-            this.leader = this.nodes.keys().next().value || null;
-
-            EventBus.emit("cluster:leader_changed", {
-                newLeader: this.leader
-            });
+        if (!node) {
+            return false;
         }
 
+        this.nodes.set(nodeId, {
+            ...node,
+            status: "REMOVED",
+            removedAt: Date.now()
+        });
+
+        this.recalculateLeader();
+
         EventBus.emit("cluster:node_removed", {
-            nodeId
+            nodeId,
+            timestamp: Date.now()
         });
 
         return true;
     }
 
+    getNode(nodeId) {
+        return this.nodes.get(nodeId) || null;
+    }
+
     listNodes() {
-        return Array.from(this.nodes.values());
+        return Array.from(this.nodes.values())
+            .filter(node => node.status !== "REMOVED")
+            .sort((a, b) => a.id.localeCompare(b.id));
+    }
+
+    getActiveNodes() {
+        return this.listNodes()
+            .filter(node => node.status === "ACTIVE");
+    }
+
+    recalculateLeader() {
+        const activeNodes = this.getActiveNodes();
+
+        const nextLeader = activeNodes.length > 0
+            ? activeNodes.map(node => node.id).sort()[0]
+            : null;
+
+        if (this.leaderNodeId !== nextLeader) {
+            this.leaderNodeId = nextLeader;
+
+            EventBus.emit("cluster:leader_selected", {
+                leaderNodeId: this.leaderNodeId,
+                timestamp: Date.now()
+            });
+        }
+
+        return this.leaderNodeId;
+    }
+
+    getLeader() {
+        if (!this.leaderNodeId) {
+            return this.recalculateLeader();
+        }
+
+        return this.leaderNodeId;
     }
 
     snapshot() {
         return {
-            totalNodes: this.nodes.size,
-            leader: this.leader
+            totalNodes: this.listNodes().length,
+            activeNodes: this.getActiveNodes().length,
+            leaderNodeId: this.getLeader(),
+            nodes: this.listNodes()
         };
     }
 }
